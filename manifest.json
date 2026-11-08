@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "21j3phy.pomodoro",
+  "name": "Pomodoro",
+  "version": "1.0.0",
+  "author": "Nirav Surabhi",
+  "license": "MIT",
+  "description": "A toaster-style pomodoro timer: twist the dial, push the lever, and stay locked to your workspace until the timer pops.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Pomodoro",
+    "description": "Pomodoro timer that locks you to the current workspace while you focus.",
+    "category": "Productivity",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

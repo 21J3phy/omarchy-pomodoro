@@ -1,0 +1,494 @@
+#!/usr/bin/env python3
+"""Pomodoro timer for Omarchy that locks you to one Hyprland workspace while
+you focus.
+
+  pomodoro start [minutes]   start a focus session, locked to the current workspace
+  pomodoro break [minutes]   start a break now
+  pomodoro stop [--force]    end whatever is running (strict mode needs --force)
+  pomodoro skip              end the current phase early and move to the next
+  pomodoro status            print state as JSON
+  pomodoro set <key> <value> change a setting (focus, short, long, longEvery,
+                             lock, strict, autoBreak)
+  pomodoro daemon            internal: the timer and workspace guard
+
+While a focus session runs, a background daemon listens on Hyprland's event
+socket. Any switch to another workspace, a special workspace (scratchpad), or
+a different monitor's workspace is bounced straight back to the locked one.
+"""
+
+import fcntl
+import json
+import os
+import signal
+import socket
+import subprocess
+import sys
+import time
+from contextlib import contextmanager
+from datetime import date
+
+RUNTIME = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "omarchy-pomodoro")
+STATE_FILE = os.path.join(RUNTIME, "state.json")
+LOCK_FILE = os.path.join(RUNTIME, "lock")
+PID_FILE = os.path.join(RUNTIME, "daemon.pid")
+CONFIG_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")), "omarchy")
+SETTINGS_FILE = os.path.join(CONFIG_DIR, "pomodoro.json")
+STATS_FILE = os.path.join(os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")), "omarchy-pomodoro", "stats.json")
+SELF = os.path.abspath(__file__)
+PLUGIN_ID = os.path.basename(os.path.dirname(os.path.dirname(SELF)))
+GLYPH = "󰔛"
+
+DEFAULT_SETTINGS = {
+    "focus": 25,
+    "short": 5,
+    "long": 15,
+    "longEvery": 4,
+    "lock": True,
+    "strict": False,
+    "autoBreak": True,
+}
+LIMITS = {"focus": (1, 60), "short": (1, 120), "long": (1, 120), "longEvery": (1, 12)}
+BOOL_KEYS = ("lock", "strict", "autoBreak")
+
+IDLE = {"phase": "idle", "startedAt": 0, "endsAt": 0, "workspace": None, "cycle": 0}
+
+
+# ---------------------------------------------------------------- storage
+
+def ensure_dirs():
+    os.makedirs(RUNTIME, exist_ok=True)
+
+
+@contextmanager
+def locked():
+    ensure_dirs()
+    with open(LOCK_FILE, "a+") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+
+
+def read_json(path, fallback):
+    try:
+        with open(path) as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else dict(fallback)
+    except (OSError, ValueError):
+        return dict(fallback)
+
+
+def write_json(path, data):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(data, fh)
+    os.replace(tmp, path)
+
+
+def load_settings():
+    data = read_json(SETTINGS_FILE, {})
+    out = dict(DEFAULT_SETTINGS)
+    for key, (lo, hi) in LIMITS.items():
+        try:
+            out[key] = max(lo, min(hi, int(data.get(key, out[key]))))
+        except (TypeError, ValueError):
+            pass
+    for key in BOOL_KEYS:
+        if isinstance(data.get(key), bool):
+            out[key] = data[key]
+    return out
+
+
+def load_state():
+    state = read_json(STATE_FILE, IDLE)
+    for k, v in IDLE.items():
+        state.setdefault(k, v)
+    return state
+
+
+def load_stats():
+    stats = read_json(STATS_FILE, {})
+    today = date.today().isoformat()
+    if stats.get("date") != today:
+        stats = {"date": today, "completed": 0, "focusMinutes": 0}
+    return stats
+
+
+# ---------------------------------------------------------------- hyprland
+
+def hyprctl(*args):
+    try:
+        return subprocess.run(["hyprctl", *args], capture_output=True, text=True, timeout=3).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+
+
+def active_workspace():
+    try:
+        ws = json.loads(hyprctl("activeworkspace", "-j"))
+        return {"id": int(ws["id"]), "name": str(ws.get("name", ws["id"]))}
+    except (ValueError, KeyError, TypeError):
+        return None
+
+
+def lua_str(s):
+    return '"' + str(s).replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def focus_workspace(ws_id):
+    hyprctl("dispatch", "hl.dsp.focus({ workspace = %s })" % lua_str(ws_id))
+
+
+def close_special(name):
+    name = name[len("special:"):] if name.startswith("special:") else name
+    hyprctl("dispatch", "hl.dsp.workspace.toggle_special(%s)" % lua_str(name))
+
+
+def notify(title, body="", replace=False, actions=None, urgency="normal"):
+    cmd = ["omarchy-notification-send", "--app-name", "pomodoro", "-g", GLYPH, "-u", urgency]
+    if replace:
+        cmd += ["--transient", "-t", "2500"]
+    cmd += [title]
+    if body:
+        cmd += [body]
+    for label, *program in actions or []:
+        cmd += ["--action", label, *program]
+    try:
+        subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    except OSError:
+        pass
+
+
+def chime(kind):
+    sound = {
+        "focus-end": "/usr/share/sounds/freedesktop/stereo/complete.oga",
+        "break-end": "/usr/share/sounds/freedesktop/stereo/bell.oga",
+    }.get(kind)
+    if sound and os.path.exists(sound):
+        try:
+            subprocess.Popen(["pw-play", sound], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError:
+            pass
+
+
+def refresh_bar():
+    try:
+        subprocess.Popen(["omarchy-shell", "-q", PLUGIN_ID + ".state", "refresh"],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError:
+        pass
+
+
+def fmt(seconds):
+    seconds = max(0, int(seconds))
+    return "%d:%02d" % (seconds // 60, seconds % 60)
+
+
+# ---------------------------------------------------------------- daemon
+
+def daemon_pid():
+    try:
+        pid = int(open(PID_FILE).read().strip())
+        os.kill(pid, 0)
+        with open("/proc/%d/cmdline" % pid, "rb") as fh:
+            if b"daemon" in fh.read():
+                return pid
+    except (OSError, ValueError):
+        pass
+    return 0
+
+
+def ensure_daemon():
+    if daemon_pid():
+        os.kill(daemon_pid(), signal.SIGUSR1)
+        return
+    subprocess.Popen([sys.executable, SELF, "daemon"], stdin=subprocess.DEVNULL,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+
+
+def event_socket():
+    sig = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")
+    if not sig:
+        return None
+    path = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "hypr", sig, ".socket2.sock")
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.connect(path)
+        s.settimeout(0.5)
+        return s
+    except OSError:
+        return None
+
+
+def advance(state, settings, now, natural):
+    """Move to the phase after the current one. Returns the new state."""
+    stats = load_stats()
+    phase = state["phase"]
+    if phase == "focus":
+        if natural:
+            stats["completed"] += 1
+            stats["focusMinutes"] += int(round((state["endsAt"] - state["startedAt"]) / 60))
+            write_json(STATS_FILE, stats)
+            chime("focus-end")
+        cycle = state.get("cycle", 0) + (1 if natural else 0)
+        if settings["autoBreak"]:
+            is_long = natural and cycle > 0 and cycle % settings["longEvery"] == 0
+            kind = "long" if is_long else "short"
+            minutes = settings[kind]
+            if natural:
+                notify("Focus done — take a break",
+                       "%d minute %s break. Workspace unlocked." % (minutes, kind),
+                       actions=[("Skip break", "bash", SELF, "skip")])
+            return {"phase": kind, "startedAt": now, "endsAt": now + minutes * 60, "workspace": None, "cycle": cycle}
+        if natural:
+            notify("Focus done", "Workspace unlocked.", actions=[("Start break", "bash", SELF, "break")])
+        return dict(IDLE, cycle=cycle)
+    # break -> idle, waiting for the user to start the next focus
+    if natural:
+        chime("break-end")
+        notify("Break's over", "Ready for the next focus session?",
+               actions=[("Start focus", "bash", SELF, "start")])
+    return dict(IDLE, cycle=state.get("cycle", 0))
+
+
+def run_daemon():
+    ensure_dirs()
+    single = open(os.path.join(RUNTIME, "daemon.lock"), "a+")
+    try:
+        fcntl.flock(single, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return  # another daemon is already running
+    with open(PID_FILE, "w") as fh:
+        fh.write(str(os.getpid()))
+    signal.signal(signal.SIGUSR1, lambda *_: None)  # wake up and re-read state
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+
+    sock = None
+    buf = b""
+    last_bounce_note = 0.0
+    last_check = 0.0
+
+    try:
+        while True:
+            now = time.time()
+            with locked():
+                state = load_state()
+                settings = load_settings()
+                if state["phase"] != "idle" and now >= state["endsAt"]:
+                    state = advance(state, settings, int(now), natural=True)
+                    write_json(STATE_FILE, state)
+                    refresh_bar()
+            if state["phase"] == "idle":
+                break
+
+            guarding = state["phase"] == "focus" and settings["lock"] and state.get("workspace")
+            target = state["workspace"]["id"] if guarding else None
+
+            if not guarding:
+                if sock:
+                    sock.close()
+                    sock = None
+                time.sleep(0.5)
+                continue
+
+            if sock is None:
+                sock = event_socket()
+                buf = b""
+                last_check = 0
+                if sock is None:
+                    time.sleep(1)
+                    continue
+
+            bounce = False
+            specials = []
+            try:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    sock.close()
+                    sock = None
+                    continue
+                buf += chunk
+            except socket.timeout:
+                pass
+            except OSError:
+                sock = None
+                continue
+
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                event, _, data = line.decode(errors="replace").partition(">>")
+                if event == "workspacev2":
+                    ws_id = data.split(",", 1)[0]
+                    if ws_id.lstrip("-").isdigit() and int(ws_id) != target:
+                        bounce = True
+                elif event == "focusedmonv2":
+                    ws_id = data.rsplit(",", 1)[-1]
+                    if ws_id.lstrip("-").isdigit() and int(ws_id) != target:
+                        bounce = True
+                elif event == "activespecialv2":
+                    parts = data.split(",")
+                    if len(parts) >= 2 and parts[1]:
+                        specials.append(parts[1])
+
+            # Belt and braces: verify every couple of seconds in case an event was missed.
+            if not bounce and time.time() - last_check > 2:
+                last_check = time.time()
+                ws = active_workspace()
+                if ws and ws["id"] != target:
+                    bounce = True
+
+            for name in specials:
+                close_special(name)
+            if bounce:
+                focus_workspace(target)
+            if (bounce or specials) and time.time() - last_bounce_note > 4:
+                last_bounce_note = time.time()
+                notify("Locked in 🔒", "Stay on workspace %s — %s left."
+                       % (state["workspace"]["name"], fmt(state["endsAt"] - time.time())), replace=True)
+    finally:
+        try:
+            if open(PID_FILE).read().strip() == str(os.getpid()):
+                os.unlink(PID_FILE)
+        except OSError:
+            pass
+
+
+# ---------------------------------------------------------------- commands
+
+def status_json():
+    state = load_state()
+    settings = load_settings()
+    stats = load_stats()
+    now = time.time()
+    remaining = max(0, int(state["endsAt"] - now)) if state["phase"] != "idle" else 0
+    out = {
+        "phase": state["phase"],
+        "startedAt": state["startedAt"],
+        "endsAt": state["endsAt"],
+        "now": int(now),
+        "remaining": remaining,
+        "workspace": state.get("workspace"),
+        "locked": state["phase"] == "focus" and settings["lock"] and bool(state.get("workspace")),
+        "cycle": state.get("cycle", 0),
+        "running": bool(daemon_pid()),
+        "settings": settings,
+        "today": {"completed": stats["completed"], "focusMinutes": stats["focusMinutes"]},
+    }
+    return out
+
+
+def cmd_start(args):
+    settings = load_settings()
+    minutes = int(args[0]) if args else settings["focus"]
+    minutes = max(1, min(60, minutes))
+    ws = active_workspace()
+    now = int(time.time())
+    with locked():
+        state = load_state()
+        state.update(phase="focus", startedAt=now, endsAt=now + minutes * 60, workspace=ws)
+        write_json(STATE_FILE, state)
+    ensure_daemon()
+    refresh_bar()
+    where = " on workspace %s" % ws["name"] if ws and settings["lock"] else ""
+    notify("Focus started", "%d minutes%s. Locked in until %s."
+           % (minutes, where, time.strftime("%-H:%M", time.localtime(now + minutes * 60)))
+           if settings["lock"] else "%d minutes. Go." % minutes)
+
+
+def cmd_break(args):
+    settings = load_settings()
+    with locked():
+        state = load_state()
+        cycle = state.get("cycle", 0)
+        if args:
+            minutes = max(1, min(120, int(args[0])))
+            kind = "short"
+        else:
+            kind = "long" if cycle > 0 and cycle % settings["longEvery"] == 0 else "short"
+            minutes = settings[kind]
+        if state["phase"] == "focus" and settings["strict"]:
+            print("strict mode: finish the focus session first", file=sys.stderr)
+            return 1
+        now = int(time.time())
+        write_json(STATE_FILE, {"phase": kind, "startedAt": now, "endsAt": now + minutes * 60,
+                                "workspace": None, "cycle": cycle})
+    ensure_daemon()
+    refresh_bar()
+    return 0
+
+
+def cmd_stop(args):
+    with locked():
+        state = load_state()
+        if state["phase"] == "focus" and load_settings()["strict"] and "--force" not in args:
+            print("strict mode: finish the focus session first", file=sys.stderr)
+            notify("Strict mode", "No bailing out. %s left." % fmt(state["endsAt"] - time.time()))
+            return 1
+        write_json(STATE_FILE, dict(IDLE, cycle=state.get("cycle", 0)))
+    pid = daemon_pid()
+    if pid:
+        os.kill(pid, signal.SIGUSR1)
+    refresh_bar()
+    return 0
+
+
+def cmd_skip(_args):
+    with locked():
+        state = load_state()
+        settings = load_settings()
+        if state["phase"] == "idle":
+            return 0
+        if state["phase"] == "focus" and settings["strict"]:
+            print("strict mode: finish the focus session first", file=sys.stderr)
+            return 1
+        state = advance(state, settings, int(time.time()), natural=False)
+        write_json(STATE_FILE, state)
+    if state["phase"] != "idle":
+        ensure_daemon()
+    refresh_bar()
+    return 0
+
+
+def cmd_set(args):
+    if len(args) != 2:
+        print("usage: pomodoro set <key> <value>", file=sys.stderr)
+        return 2
+    key, value = args
+    data = read_json(SETTINGS_FILE, {})
+    if key in LIMITS:
+        lo, hi = LIMITS[key]
+        data[key] = max(lo, min(hi, int(value)))
+    elif key in BOOL_KEYS:
+        data[key] = value.lower() in ("1", "true", "on", "yes")
+    else:
+        print("unknown key: %s" % key, file=sys.stderr)
+        return 2
+    write_json(SETTINGS_FILE, data)
+    pid = daemon_pid()
+    if pid:
+        os.kill(pid, signal.SIGUSR1)
+    return 0
+
+
+def main(argv):
+    cmd, args = (argv[0], argv[1:]) if argv else ("status", [])
+    if cmd == "daemon":
+        run_daemon()
+        return 0
+    if cmd == "status":
+        out = status_json()
+        if out["phase"] != "idle" and not out["running"]:
+            ensure_daemon()  # keep the timer and lock alive if the daemon died
+        print(json.dumps(out))
+        return 0
+    handlers = {"start": cmd_start, "break": cmd_break, "stop": cmd_stop, "skip": cmd_skip, "set": cmd_set}
+    if cmd not in handlers:
+        print(__doc__.strip())
+        return 2
+    return handlers[cmd](args) or 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

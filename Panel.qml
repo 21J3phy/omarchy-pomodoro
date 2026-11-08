@@ -1,5 +1,6 @@
 import QtQuick
 import Quickshell
+import Quickshell.Hyprland
 import Quickshell.Io
 import qs.Commons
 import qs.Commons as Commons
@@ -29,7 +30,8 @@ Panel {
   property int cycle: 0
   property int completedToday: 0
   property int minutesToday: 0
-  property var cfg: ({ focus: 25, short: 5, long: 15, longEvery: 4, lock: true, strict: false, autoBreak: true })
+  property var cfg: ({ focus: 25, short: 5, long: 15, longEvery: 4, lock: true, strict: false, autoBreak: true,
+                       mini: false, miniX: -1, miniY: -1, miniScreen: "" })
   property bool busy: false
   property bool pendingStart: false
   property bool showSettings: false
@@ -47,6 +49,23 @@ Panel {
   readonly property real progress: running ? Math.min(1, Math.max(0, 1 - remaining / total)) : 0
   readonly property bool strictLock: focusing && cfg.strict === true
   readonly property bool vertical: root.bar ? root.bar.vertical : false
+
+  // The bar, and so this widget, exists once per monitor. Only the copy on
+  // the chosen monitor shows the floating timer; if that monitor is gone, the
+  // first one takes it.
+  readonly property var myScreen: {
+    var w = root.QsWindow.window
+    return w && w.screen ? w.screen : null
+  }
+  readonly property string myScreenName: root.myScreen ? String(root.myScreen.name || "") : ""
+  readonly property bool miniHere: {
+    if (root.cfg.mini !== true || !root.myScreen) return false
+    var screens = Quickshell.screens
+    for (var i = 0; i < screens.length; i++) {
+      if (screens[i].name === root.cfg.miniScreen) return screens[i].name === root.myScreenName
+    }
+    return screens.length > 0 && screens[0].name === root.myScreenName
+  }
 
   // The appliance has its own physical palette; only the enamel takes the
   // theme's accent hue, so it still belongs to the desktop.
@@ -86,7 +105,11 @@ Panel {
     var today = data.today && typeof data.today === "object" ? data.today : {}
     root.completedToday = parseInt(today.completed, 10) || 0
     root.minutesToday = parseInt(today.focusMinutes, 10) || 0
-    if (data.settings && typeof data.settings === "object") root.cfg = data.settings
+    if (data.settings && typeof data.settings === "object") {
+      // Settings still waiting to be saved win over what's on disk, so a
+      // status poll can't snap the dial or the floating timer back.
+      root.cfg = Object.assign({}, data.settings, root.pendingValues)
+    }
     if (typeof data.phrase === "string" && data.phrase.length > 0 && data.phrase.length < 300) root.phrase = data.phrase
     if (!root.focusing) root.pendingExit = ""
     root.pendingStart = false
@@ -102,15 +125,41 @@ Panel {
   }
 
   function setValue(key, value) {
-    var next = Object.assign({}, root.cfg)
-    next[key] = value
-    root.cfg = next
-    pendingKey = key
-    pendingValue = String(value)
+    var change = {}
+    change[key] = value
+    root.setValues(change)
+  }
+  // Changes land in cfg at once and reach the script together, shortly after.
+  function setValues(change) {
+    root.cfg = Object.assign({}, root.cfg, change)
+    root.pendingValues = Object.assign({}, root.pendingValues, change)
     saveTimer.restart()
   }
-  property string pendingKey: ""
-  property string pendingValue: ""
+  property var pendingValues: ({})
+
+  function flushSettings() {
+    var keys = Object.keys(root.pendingValues)
+    if (keys.length === 0) return
+    // Another command is still running; try again in a moment.
+    if (actionProc.running) { saveTimer.restart(); return }
+    var args = ["set"]
+    for (var i = 0; i < keys.length; i++) args.push(keys[i], String(root.pendingValues[keys[i]]))
+    root.pendingValues = ({})
+    root.runAction(args)
+  }
+
+  // Show or hide the always-on-top timer. Showing it puts it on `screenName`.
+  function setMini(on, screenName) {
+    if (!on) { root.setValue("mini", false); return }
+    var change = { mini: true }
+    if (screenName) change.miniScreen = screenName
+    root.setValues(change)
+  }
+  function toggleMini(screenName) { root.setMini(root.cfg.mini !== true, screenName) }
+  function focusedScreenName() {
+    var m = Hyprland.focusedMonitor
+    return m ? String(m.name || "") : root.myScreenName
+  }
 
   function startFocus() {
     if (root.running || root.busy) return
@@ -151,7 +200,7 @@ Panel {
   Timer {
     id: saveTimer
     interval: 400
-    onTriggered: root.runAction(["set", root.pendingKey, root.pendingValue])
+    onTriggered: root.flushSettings()
   }
 
   Process {
@@ -190,6 +239,16 @@ Panel {
     function refresh(): void { root.refresh() }
     // Same as pressing STOP: during focus it asks for the confession first.
     function stop(): void { root.refresh(); root.requestExit("stop") }
+    // The always-on-top timer, on the focused monitor.
+    function mini(): void { root.toggleMini(root.focusedScreenName()) }
+    function showMini(): void { root.setMini(true, root.focusedScreenName()) }
+    function hideMini(): void { root.setMini(false) }
+  }
+
+  MiniTimer {
+    owner: root
+    screen: root.myScreen
+    shown: root.miniHere
   }
 
   // ------------------------------------------------------------------ bar
@@ -214,6 +273,7 @@ Panel {
         : strings.t("tooltip.break").arg(root.clock(root.remaining))
     onPressed: function(b) {
       if (b === Qt.RightButton) root.quickAction()
+      else if (b === Qt.MiddleButton) root.toggleMini(root.myScreenName)
       else root.toggle()
     }
   }
@@ -233,8 +293,12 @@ Panel {
     font.bold: root.focusing
     MouseArea {
       anchors.fill: parent
-      acceptedButtons: Qt.LeftButton | Qt.RightButton
-      onClicked: function(mouse) { mouse.button === Qt.RightButton ? root.quickAction() : root.toggle() }
+      acceptedButtons: Qt.LeftButton | Qt.RightButton | Qt.MiddleButton
+      onClicked: function(mouse) {
+        if (mouse.button === Qt.RightButton) root.quickAction()
+        else if (mouse.button === Qt.MiddleButton) root.toggleMini(root.myScreenName)
+        else root.toggle()
+      }
     }
   }
 
@@ -688,14 +752,36 @@ Panel {
           }
         }
 
-        // ---- settings, folded away
-        Button {
-          text: strings.t("settings")
-          iconText: root.showSettings ? "󰅃" : "󰅀"
-          foreground: root.bar.foreground
-          fontFamily: root.bar.fontFamily
-          fontSize: Style.font.bodySmall
-          onClicked: root.showSettings = !root.showSettings
+        // ---- settings, folded away, and the floating timer toggle
+        Item {
+          width: parent.width
+          height: Math.max(settingsButton.implicitHeight, miniButton.implicitHeight)
+
+          Button {
+            id: settingsButton
+            anchors.left: parent.left
+            anchors.verticalCenter: parent.verticalCenter
+            text: strings.t("settings")
+            iconText: root.showSettings ? "󰅃" : "󰅀"
+            foreground: root.bar.foreground
+            fontFamily: root.bar.fontFamily
+            fontSize: Style.font.bodySmall
+            onClicked: root.showSettings = !root.showSettings
+          }
+          Button {
+            id: miniButton
+            anchors.right: parent.right
+            anchors.verticalCenter: parent.verticalCenter
+            text: strings.t(root.cfg.mini === true ? "mini.toggle.on" : "mini.toggle.off")
+            iconText: root.cfg.mini === true ? "󰐃" : "󰤰"
+            tooltipText: strings.t("mini.toggle.tooltip")
+            selected: root.cfg.mini === true
+            bordered: true
+            foreground: root.bar.foreground
+            fontFamily: root.bar.fontFamily
+            fontSize: Style.font.bodySmall
+            onClicked: root.toggleMini(root.myScreenName)
+          }
         }
 
         Column {

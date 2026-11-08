@@ -104,6 +104,16 @@ event leaves the locked workspace, it dispatches
 checks the active workspace every two seconds in case it missed an event. The
 daemon exits when no session is running.
 
+## Uninstall
+
+```bash
+bin/pomodoro stop --force --phrase "I am being very unproductive and wasting my time by doing this."   # only if a session is running
+omarchy plugin remove 21j3phy.pomodoro
+```
+
+Optionally delete the settings and stats it left behind:
+`~/.config/omarchy/pomodoro.json` and `~/.local/state/omarchy-pomodoro/`.
+
 ## License
 
 MIT

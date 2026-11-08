@@ -10,8 +10,13 @@ you focus.
                              so they need --phrase "<the confession below>";
                              strict mode refuses them unless --force too)
   pomodoro status            print state as JSON
-  pomodoro set <key> <value> change a setting (focus, short, long, longEvery,
-                             lock, strict, autoBreak)
+  pomodoro set <key> <value> [<key> <value> ...]
+                             change settings (focus, short, long, longEvery,
+                             lock, strict, autoBreak, mini, miniX, miniY,
+                             miniScreen); a true/false setting also takes
+                             "toggle"
+  pomodoro mini [on|off|toggle]
+                             show or hide the always-on-top timer window
   pomodoro daemon            internal: the timer and workspace guard
 
 While a focus session runs, a background daemon listens on Hyprland's event
@@ -50,9 +55,21 @@ DEFAULT_SETTINGS = {
     "lock": True,
     "strict": False,
     "autoBreak": True,
+    # The always-on-top timer window: whether it shows, where (top-left corner
+    # in logical pixels, -1 for the default spot) and on which monitor.
+    "mini": False,
+    "miniX": -1,
+    "miniY": -1,
+    "miniScreen": "",
 }
-LIMITS = {"focus": (1, 60), "short": (1, 120), "long": (1, 120), "longEvery": (1, 12)}
-BOOL_KEYS = ("lock", "strict", "autoBreak")
+LIMITS = {"focus": (1, 60), "short": (1, 120), "long": (1, 120), "longEvery": (1, 12),
+          "miniX": (-1, 20000), "miniY": (-1, 20000)}
+BOOL_KEYS = ("lock", "strict", "autoBreak", "mini")
+SCREEN_CHARS = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.:")
+
+
+def valid_screen(name):
+    return isinstance(name, str) and len(name) <= 64 and set(name) <= SCREEN_CHARS
 
 IDLE = {"phase": "idle", "startedAt": 0, "endsAt": 0, "workspace": None, "cycle": 0}
 
@@ -102,6 +119,8 @@ def load_settings():
     for key in BOOL_KEYS:
         if isinstance(data.get(key), bool):
             out[key] = data[key]
+    if valid_screen(data.get("miniScreen")):
+        out["miniScreen"] = data["miniScreen"]
     return out
 
 
@@ -497,24 +516,46 @@ def cmd_skip(args):
 
 
 def cmd_set(args):
-    if len(args) != 2:
-        print("usage: pomodoro set <key> <value>", file=sys.stderr)
+    if not args or len(args) % 2:
+        print("usage: pomodoro set <key> <value> [<key> <value> ...]", file=sys.stderr)
         return 2
-    key, value = args
+    current = load_settings()
     data = read_json(SETTINGS_FILE, {})
-    if key in LIMITS:
-        lo, hi = LIMITS[key]
-        data[key] = max(lo, min(hi, int(value)))
-    elif key in BOOL_KEYS:
-        data[key] = value.lower() in ("1", "true", "on", "yes")
-    else:
-        print("unknown key: %s" % key, file=sys.stderr)
-        return 2
+    for key, value in zip(args[::2], args[1::2]):
+        if key in LIMITS:
+            lo, hi = LIMITS[key]
+            try:
+                data[key] = max(lo, min(hi, int(value)))
+            except ValueError:
+                print("%s needs a number: %s" % (key, value), file=sys.stderr)
+                return 2
+        elif key in BOOL_KEYS:
+            if value.lower() == "toggle":
+                data[key] = not current[key]
+            else:
+                data[key] = value.lower() in ("1", "true", "on", "yes")
+        elif key == "miniScreen":
+            if not valid_screen(value):
+                print("not a monitor name: %s" % value, file=sys.stderr)
+                return 2
+            data[key] = value
+        else:
+            print("unknown key: %s" % key, file=sys.stderr)
+            return 2
     write_json(SETTINGS_FILE, data)
     pid = daemon_pid()
     if pid:
         os.kill(pid, signal.SIGUSR1)
+    refresh_bar()
     return 0
+
+
+def cmd_mini(args):
+    value = args[0] if args else "toggle"
+    if value.lower() not in ("on", "off", "toggle", "true", "false", "1", "0", "yes", "no"):
+        print("usage: pomodoro mini [on|off|toggle]", file=sys.stderr)
+        return 2
+    return cmd_set(["mini", value])
 
 
 def main(argv):
@@ -528,7 +569,8 @@ def main(argv):
             ensure_daemon()  # keep the timer and lock alive if the daemon died
         print(json.dumps(out))
         return 0
-    handlers = {"start": cmd_start, "break": cmd_break, "stop": cmd_stop, "skip": cmd_skip, "set": cmd_set}
+    handlers = {"start": cmd_start, "break": cmd_break, "stop": cmd_stop, "skip": cmd_skip, "set": cmd_set,
+                "mini": cmd_mini}
     if cmd not in handlers:
         print(__doc__.strip())
         return 2

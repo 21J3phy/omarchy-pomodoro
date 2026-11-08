@@ -1,6 +1,6 @@
 {
   "title": "Pomodoro",
-  "tooltip.idle": "Pomodoro — click to open, right-click to start focus",
+  "tooltip.idle": "Pomodoro — click to open, right-click to start focus, middle-click for the floating timer",
   "tooltip.focus": "Focus · %1 left · locked to workspace %2",
   "tooltip.focusUnlocked": "Focus · %1 left",
   "tooltip.break": "Break · %1 left",
@@ -42,5 +42,13 @@
   "confess.keep": "Keep focusing",
   "confess.do.stop": "Give up",
   "confess.do.break": "Take the break",
-  "confess.do.skip": "Skip"
+  "confess.do.skip": "Skip",
+  "mini.toggle.off": "Float",
+  "mini.toggle.on": "Floating",
+  "mini.toggle.tooltip": "Keep a small timer on top of every window. Middle-click the bar icon to toggle it too.",
+  "mini.focus": "Focus",
+  "mini.focusLocked": "Focus · ws %1",
+  "mini.break": "Break",
+  "mini.longBreak": "Long break",
+  "mini.ready": "Ready"
 }

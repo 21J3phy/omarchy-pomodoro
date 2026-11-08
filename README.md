@@ -27,6 +27,21 @@ the Lua dispatchers.
 - **Push the lever down** to start.
 - **BREAK / SKIP / STOP** do what they say.
 - **Right-click** the bar icon to start a session straight away.
+- **Middle-click** the bar icon, or press **Float** in the panel, to toggle the
+  floating timer.
+
+### Floating timer
+
+A small readout that stays on top of every window, fullscreen ones included,
+on whichever monitor you turned it on from. It never takes keyboard focus.
+
+- **Drag** it anywhere; it remembers the spot.
+- **Click** it to open the toaster.
+- **×** or a middle-click hides it. ▶ starts focus when idle; the expand
+  button opens the toaster while a session runs.
+
+From a keybinding: `omarchy-shell 21j3phy.pomodoro.state mini` toggles it on
+the focused monitor (`showMini` / `hideMini` also exist).
 
 ### Bailing out costs you a sentence
 
@@ -66,6 +81,8 @@ bin/pomodoro skip | stop | status
 bin/pomodoro stop --phrase "I am being very unproductive and wasting my time by doing this."
 bin/pomodoro stop --force --phrase "..."   # escape hatch for strict mode
 bin/pomodoro set short 10       # focus, short, long, longEvery, lock, strict, autoBreak
+bin/pomodoro set miniX 40 miniY 40   # several pairs at once; true/false keys take "toggle"
+bin/pomodoro mini [on|off|toggle]    # the floating timer
 ```
 
 During focus, `stop`, `skip` and `break` need `--phrase`. During a break

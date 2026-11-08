@@ -24,10 +24,19 @@ the Lua dispatchers.
 - **Click** the timer in the bar to open the toaster.
 - **Twist the dial** (drag it clockwise, or scroll) to set the focus length,
   from 1 to 60 minutes.
-- **Push the lever down** to start. Pull it up twice to give up.
-- **BREAK / SKIP / STOP** do what they say. STOP needs a second press during
-  focus.
+- **Push the lever down** to start.
+- **BREAK / SKIP / STOP** do what they say.
 - **Right-click** the bar icon to start a session straight away.
+
+### Bailing out costs you a sentence
+
+Ending a focus session early, whether with STOP, the lever, BREAK or SKIP,
+opens a box you have to type this into, word for word:
+
+> I am being very unproductive and wasting my time by doing this.
+
+Pasting doesn't work. The script checks the sentence itself, so the terminal
+won't get you out either. Breaks have no such toll.
 
 In the bar, a running timer is a small dial whose wedge is the time left. It's
 red while you focus and green on a break, with the minutes beside it.
@@ -42,8 +51,8 @@ Under **Settings** in the panel:
 
 - break lengths and how often the long break comes
 - **Lock to workspace**: on by default
-- **Strict mode**: the lever locks and STOP/SKIP stop working until the timer
-  ends
+- **Strict mode**: the lever locks and BREAK/SKIP/STOP stop working until the
+  timer ends
 - **Start breaks automatically**
 
 ## CLI
@@ -54,9 +63,16 @@ The panel drives `bin/pomodoro`, which you can also use directly:
 bin/pomodoro start [minutes]    # focus, locked to the current workspace
 bin/pomodoro break [minutes]
 bin/pomodoro skip | stop | status
-bin/pomodoro stop --force       # escape hatch for strict mode
+bin/pomodoro stop --phrase "I am being very unproductive and wasting my time by doing this."
+bin/pomodoro stop --force --phrase "..."   # escape hatch for strict mode
 bin/pomodoro set short 10       # focus, short, long, longEvery, lock, strict, autoBreak
 ```
+
+During focus, `stop`, `skip` and `break` need `--phrase`. During a break
+they don't.
+
+To open the STOP confession from a keybinding:
+`omarchy-shell 21j3phy.pomodoro.state stop`.
 
 Settings live in `~/.config/omarchy/pomodoro.json`, daily stats in
 `~/.local/state/omarchy-pomodoro/stats.json`, and the running session in

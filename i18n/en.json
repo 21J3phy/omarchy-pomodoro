@@ -27,9 +27,20 @@
   "hint.focus": "Toasting · stay on this workspace",
   "hint.strict": "Strict mode · no way out",
   "hint.break": "Break · workspace unlocked",
-  "hint.confirm": "Pull or press again to give up",
+  "hint.confirm": "Type it out to bail",
   "button.break": "BREAK",
   "button.skip": "SKIP",
   "button.stop": "STOP",
-  "button.sure": "SURE?"
+  "confess.title.stop": "Giving up on this focus session?",
+  "confess.title.break": "Starting your break early?",
+  "confess.title.skip": "Skipping the rest of this focus session?",
+  "confess.body": "There's %1 left. If you really want out, type this:",
+  "confess.placeholder": "Type it out. No pasting.",
+  "confess.progress": "%1 / %2 characters",
+  "confess.typo": "That's not what it says. Keep typing, or go back to work.",
+  "confess.ok": "Fine. Press Enter.",
+  "confess.keep": "Keep focusing",
+  "confess.do.stop": "Give up",
+  "confess.do.break": "Take the break",
+  "confess.do.skip": "Skip"
 }

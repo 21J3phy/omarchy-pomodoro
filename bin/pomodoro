@@ -4,8 +4,11 @@ you focus.
 
   pomodoro start [minutes]   start a focus session, locked to the current workspace
   pomodoro break [minutes]   start a break now
-  pomodoro stop [--force]    end whatever is running (strict mode needs --force)
+  pomodoro stop              end whatever is running
   pomodoro skip              end the current phase early and move to the next
+                             (stop, skip and break end a focus session early,
+                             so they need --phrase "<the confession below>";
+                             strict mode refuses them unless --force too)
   pomodoro status            print state as JSON
   pomodoro set <key> <value> change a setting (focus, short, long, longEvery,
                              lock, strict, autoBreak)
@@ -37,6 +40,7 @@ STATS_FILE = os.path.join(os.environ.get("XDG_STATE_HOME", os.path.expanduser("~
 SELF = os.path.abspath(__file__)
 PLUGIN_ID = os.path.basename(os.path.dirname(os.path.dirname(SELF)))
 GLYPH = "󰔛"
+PHRASE = "I am being very unproductive and wasting my time by doing this."
 
 DEFAULT_SETTINGS = {
     "focus": 25,
@@ -179,6 +183,47 @@ def refresh_bar():
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except OSError:
         pass
+
+
+def normalize(text):
+    return " ".join(str(text).lower().split()).rstrip(".!").strip()
+
+
+def phrase_ok(flags):
+    return normalize(flags.get("phrase", "")) == normalize(PHRASE)
+
+
+def parse(args):
+    """Split argv into positionals and --flags (--name value, or bare --name)."""
+    pos, flags, i = [], {}, 0
+    while i < len(args):
+        a = args[i]
+        if a == "--force":
+            flags["force"] = True
+        elif a.startswith("--phrase="):
+            flags["phrase"] = a.split("=", 1)[1]
+        elif a == "--phrase" and i + 1 < len(args):
+            flags["phrase"] = args[i + 1]
+            i += 1
+        else:
+            pos.append(a)
+        i += 1
+    return pos, flags
+
+
+def may_leave_focus(state, settings, flags, verb):
+    """Ending focus early takes typing out the confession; strict mode also needs --force."""
+    if state["phase"] != "focus":
+        return True
+    if settings["strict"] and not flags.get("force"):
+        print("strict mode: finish the focus session first", file=sys.stderr)
+        notify("Strict mode", "No bailing out. %s left." % fmt(state["endsAt"] - time.time()))
+        return False
+    if not phrase_ok(flags):
+        print('to %s a focus session early, type it out:\n  pomodoro %s --phrase "%s"'
+              % (verb, verb, PHRASE), file=sys.stderr)
+        return False
+    return True
 
 
 def fmt(seconds):
@@ -374,6 +419,7 @@ def status_json():
         "cycle": state.get("cycle", 0),
         "running": bool(daemon_pid()),
         "settings": settings,
+        "phrase": PHRASE,
         "today": {"completed": stats["completed"], "focusMinutes": stats["focusMinutes"]},
     }
     return out
@@ -398,6 +444,7 @@ def cmd_start(args):
 
 
 def cmd_break(args):
+    args, flags = parse(args)
     settings = load_settings()
     with locked():
         state = load_state()
@@ -408,8 +455,7 @@ def cmd_break(args):
         else:
             kind = "long" if cycle > 0 and cycle % settings["longEvery"] == 0 else "short"
             minutes = settings[kind]
-        if state["phase"] == "focus" and settings["strict"]:
-            print("strict mode: finish the focus session first", file=sys.stderr)
+        if not may_leave_focus(state, settings, flags, "break"):
             return 1
         now = int(time.time())
         write_json(STATE_FILE, {"phase": kind, "startedAt": now, "endsAt": now + minutes * 60,
@@ -420,11 +466,10 @@ def cmd_break(args):
 
 
 def cmd_stop(args):
+    _, flags = parse(args)
     with locked():
         state = load_state()
-        if state["phase"] == "focus" and load_settings()["strict"] and "--force" not in args:
-            print("strict mode: finish the focus session first", file=sys.stderr)
-            notify("Strict mode", "No bailing out. %s left." % fmt(state["endsAt"] - time.time()))
+        if not may_leave_focus(state, load_settings(), flags, "stop"):
             return 1
         write_json(STATE_FILE, dict(IDLE, cycle=state.get("cycle", 0)))
     pid = daemon_pid()
@@ -434,14 +479,14 @@ def cmd_stop(args):
     return 0
 
 
-def cmd_skip(_args):
+def cmd_skip(args):
+    _, flags = parse(args)
     with locked():
         state = load_state()
         settings = load_settings()
         if state["phase"] == "idle":
             return 0
-        if state["phase"] == "focus" and settings["strict"]:
-            print("strict mode: finish the focus session first", file=sys.stderr)
+        if not may_leave_focus(state, settings, flags, "skip"):
             return 1
         state = advance(state, settings, int(time.time()), natural=False)
         write_json(STATE_FILE, state)

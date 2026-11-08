@@ -32,8 +32,12 @@ Panel {
   property var cfg: ({ focus: 25, short: 5, long: 15, longEvery: 4, lock: true, strict: false, autoBreak: true })
   property bool busy: false
   property bool pendingStart: false
-  property bool confirmingGiveUp: false
   property bool showSettings: false
+  // Ending focus early ("stop", "skip" or "break") waits here until the
+  // confession has been typed out.
+  property string pendingExit: ""
+  property string phrase: "I am being very unproductive and wasting my time by doing this."
+  readonly property bool confirming: pendingExit !== "" && focusing
 
   readonly property bool running: phase !== "idle"
   readonly property bool focusing: phase === "focus"
@@ -83,7 +87,8 @@ Panel {
     root.completedToday = parseInt(today.completed, 10) || 0
     root.minutesToday = parseInt(today.focusMinutes, 10) || 0
     if (data.settings && typeof data.settings === "object") root.cfg = data.settings
-    if (!root.focusing) root.confirmingGiveUp = false
+    if (typeof data.phrase === "string" && data.phrase.length > 0 && data.phrase.length < 300) root.phrase = data.phrase
+    if (!root.focusing) root.pendingExit = ""
     root.pendingStart = false
   }
 
@@ -113,25 +118,35 @@ Panel {
     root.runAction(["start"])
   }
 
-  // Stopping a focus session takes two presses (or two pulls of the lever).
-  function giveUp() {
-    if (root.strictLock) return
-    if (!root.focusing) { root.runAction(["stop"]); return }
-    if (root.confirmingGiveUp) {
-      root.confirmingGiveUp = false
-      root.runAction(["stop"])
-    } else {
-      root.confirmingGiveUp = true
-      confirmReset.restart()
-    }
+  // Leaving a break is free. Leaving focus early means typing out the
+  // confession first; the script checks it again, so the CLI is no shortcut.
+  function requestExit(action) {
+    if (root.strictLock || root.busy) return
+    if (!root.focusing) { root.runAction([action]); return }
+    root.pendingExit = action
+    if (!root.opened) root.open()
+  }
+  function giveUp() { root.requestExit("stop") }
+
+  function normalize(t) { return String(t).toLowerCase().split(/\s+/).join(" ").replace(/[.!]+$/, "").trim() }
+  function phraseMatches(t) { return root.normalize(t) === root.normalize(root.phrase) }
+  // True while what's typed so far is still on track.
+  function phraseOnTrack(t) {
+    var typed = String(t).toLowerCase().replace(/\s+/g, " ").replace(/^ /, "")
+    return root.phrase.toLowerCase().indexOf(typed) === 0 || root.phraseMatches(t)
+  }
+
+  function confirmExit(typed) {
+    if (!root.confirming || !root.phraseMatches(typed)) return
+    var action = root.pendingExit
+    root.pendingExit = ""
+    root.runAction([action, "--phrase", typed])
   }
 
   function quickAction() {
     if (!root.running) root.startFocus()
-    else if (!root.strictLock) root.runAction(["stop"])
+    else root.requestExit("stop")
   }
-
-  Timer { id: confirmReset; interval: 4000; onTriggered: root.confirmingGiveUp = false }
 
   Timer {
     id: saveTimer
@@ -173,6 +188,8 @@ Panel {
   ShellIpc {
     target: root.moduleName + ".state"
     function refresh(): void { root.refresh() }
+    // Same as pressing STOP: during focus it asks for the confession first.
+    function stop(): void { root.refresh(); root.requestExit("stop") }
   }
 
   // ------------------------------------------------------------------ bar
@@ -458,12 +475,12 @@ Panel {
                   Text {
                     anchors.horizontalCenter: parent.horizontalCenter
                     textFormat: Text.PlainText
-                    text: (root.confirmingGiveUp ? strings.t("hint.confirm")
+                    text: (root.confirming ? strings.t("hint.confirm")
                       : root.strictLock ? strings.t("hint.strict")
                       : root.focusing ? strings.t("hint.focus")
                       : root.onBreak ? strings.t("hint.break")
                       : strings.t("hint.idle")).toUpperCase()
-                    color: root.confirmingGiveUp ? root.red : Qt.rgba(1, 0.71, 0.28, 0.6)
+                    color: root.confirming ? root.red : Qt.rgba(1, 0.71, 0.28, 0.6)
                     font.family: root.bar.fontFamily
                     font.pixelSize: 9
                     font.letterSpacing: 1.6
@@ -481,26 +498,148 @@ Panel {
                   lit: root.onBreak
                   lampColor: root.green
                   fontFamily: root.bar.fontFamily
+                  armed: root.confirming && root.pendingExit === "break"
                   enabled: !root.busy && !root.onBreak && !root.strictLock
-                  onClicked: root.runAction(["break"])
+                  onClicked: root.requestExit("break")
                 }
                 ApplianceButton {
                   label: strings.t("button.skip")
                   lit: false
                   lampColor: root.amber
                   fontFamily: root.bar.fontFamily
+                  armed: root.confirming && root.pendingExit === "skip"
                   enabled: !root.busy && root.running && !root.strictLock
-                  onClicked: root.runAction(["skip"])
+                  onClicked: root.requestExit("skip")
                 }
                 ApplianceButton {
-                  label: root.confirmingGiveUp ? strings.t("button.sure") : strings.t("button.stop")
+                  label: strings.t("button.stop")
                   lit: root.focusing
-                  armed: root.confirmingGiveUp
+                  armed: root.confirming && root.pendingExit === "stop"
                   lampColor: root.red
                   fontFamily: root.bar.fontFamily
                   enabled: !root.busy && root.running && !root.strictLock
                   onClicked: root.giveUp()
                 }
+              }
+            }
+          }
+        }
+
+        // ---- the confession: type it out to end focus early
+        Rectangle {
+          id: confession
+          visible: root.confirming
+          width: parent.width
+          height: confessionColumn.implicitHeight + 32
+          radius: 14
+          color: Qt.rgba(root.red.r, root.red.g, root.red.b, 0.08)
+          border.width: 1.5
+          border.color: Qt.rgba(root.red.r, root.red.g, root.red.b, 0.6)
+
+          onVisibleChanged: {
+            confessionField.text = ""
+            if (visible) Qt.callLater(function() { confessionField.forceActiveFocus() })
+          }
+
+          readonly property bool matches: root.phraseMatches(confessionField.text)
+          readonly property bool onTrack: root.phraseOnTrack(confessionField.text)
+
+          Column {
+            id: confessionColumn
+            x: 16
+            y: 16
+            width: parent.width - 32
+            spacing: 10
+
+            Text {
+              width: parent.width
+              textFormat: Text.PlainText
+              wrapMode: Text.WordWrap
+              text: strings.t("confess.title." + (root.pendingExit || "stop"))
+              color: root.red
+              font.family: root.bar.fontFamily
+              font.pixelSize: Style.font.subtitle
+              font.bold: true
+            }
+            Text {
+              width: parent.width
+              textFormat: Text.PlainText
+              wrapMode: Text.WordWrap
+              text: strings.t("confess.body").arg(root.clock(root.remaining))
+              color: root.bar.foreground
+              opacity: 0.75
+              font.family: root.bar.fontFamily
+              font.pixelSize: Style.font.bodySmall
+            }
+            Text {
+              width: parent.width
+              textFormat: Text.PlainText
+              wrapMode: Text.WordWrap
+              text: "\u201C" + root.phrase + "\u201D"
+              color: root.bar.foreground
+              font.family: root.bar.fontFamily
+              font.pixelSize: Style.font.body
+              font.italic: true
+            }
+
+            TextField {
+              id: confessionField
+              width: parent.width
+              placeholderText: strings.t("confess.placeholder")
+              foreground: root.bar.foreground
+              accent: confession.onTrack ? Commons.Color.accent : root.red
+              font.family: root.bar.fontFamily
+              font.pixelSize: Style.font.bodySmall
+              // Type it, don't paste it.
+              Keys.onPressed: function(event) {
+                if (event.matches(StandardKey.Paste) || (event.key === Qt.Key_Insert && (event.modifiers & Qt.ShiftModifier))) {
+                  event.accepted = true
+                } else if (event.key === Qt.Key_Escape) {
+                  root.pendingExit = ""
+                  event.accepted = true
+                }
+              }
+              onAccepted: root.confirmExit(text)
+              MouseArea {
+                anchors.fill: parent
+                acceptedButtons: Qt.MiddleButton | Qt.RightButton
+                onClicked: confessionField.forceActiveFocus()
+              }
+            }
+
+            Text {
+              width: parent.width
+              textFormat: Text.PlainText
+              text: confession.matches ? strings.t("confess.ok")
+                : confession.onTrack ? strings.t("confess.progress").arg(confessionField.text.length).arg(root.phrase.length)
+                : strings.t("confess.typo")
+              color: confession.matches ? root.amber : confession.onTrack ? root.bar.foreground : root.red
+              opacity: confession.onTrack && !confession.matches ? 0.55 : 1
+              font.family: root.bar.fontFamily
+              font.pixelSize: Style.font.caption
+            }
+
+            Row {
+              spacing: 8
+              Button {
+                text: strings.t("confess.keep")
+                iconText: "󰐊"
+                bordered: true
+                foreground: root.bar.foreground
+                fontFamily: root.bar.fontFamily
+                fontSize: Style.font.bodySmall
+                onClicked: root.pendingExit = ""
+              }
+              Button {
+                text: strings.t("confess.do." + (root.pendingExit || "stop"))
+                iconText: "󰓛"
+                bordered: true
+                enabled: confession.matches && !root.busy
+                opacity: enabled ? 1 : 0.4
+                foreground: root.red
+                fontFamily: root.bar.fontFamily
+                fontSize: Style.font.bodySmall
+                onClicked: root.confirmExit(confessionField.text)
               }
             }
           }
